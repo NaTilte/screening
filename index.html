@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Remote Control</title>
+<style>
+  html, body { margin:0; padding:0; background:#000; overflow:hidden; touch-action:none; height:100%; }
+  #wrap { position:relative; width:100vw; height:100vh; }
+  #screen { width:100%; height:100%; object-fit:contain; display:block; user-select:none; -webkit-user-drag:none; }
+  #status {
+    position:absolute; top:8px; left:8px; color:#0f0; font:12px monospace;
+    background:rgba(0,0,0,0.4); padding:2px 6px; border-radius:4px;
+  }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <img id="screen" draggable="false">
+  <div id="status">подключение...</div>
+</div>
+
+<script>
+const tg = window.Telegram?.WebApp;
+tg?.expand();
+tg?.ready();
+
+// ---------- Конфигурация из query-параметров ----------
+// Раньше TOKEN/HOST подставлял Jinja2 на сервере. Теперь страница статическая (GitHub Pages),
+// поэтому сервер (бот) сам собирает ссылку вида:
+// https://юзер.github.io/repo/?ws=wss://xxxx.ngrok-free.dev/ws/screen&token=XXXX
+const params = new URLSearchParams(location.search);
+const WS_URL = params.get("ws");     // полный адрес вебсокета, например wss://xxxx.ngrok-free.dev/ws/screen
+const TOKEN  = params.get("token");  // тот же AUTH_TOKEN из config.py
+
+const screenImg = document.getElementById("screen");
+const statusEl  = document.getElementById("status");
+
+if (!WS_URL || !TOKEN) {
+  statusEl.textContent = "ошибка: нет ws/token в ссылке";
+} else {
+  const screenWs = new WebSocket(`${WS_URL}?token=${encodeURIComponent(TOKEN)}`);
+  screenWs.binaryType = "blob";
+
+  screenWs.onopen  = () => statusEl.textContent = "экран: OK";
+  screenWs.onclose = () => statusEl.textContent = "экран: отключено";
+  screenWs.onerror = () => statusEl.textContent = "экран: ошибка соединения";
+
+  screenWs.onmessage = (ev) => {
+    const url = URL.createObjectURL(ev.data);
+    const oldUrl = screenImg.dataset.blobUrl;
+    screenImg.src = url;
+    screenImg.dataset.blobUrl = url;
+    if (oldUrl) URL.revokeObjectURL(oldUrl);
+  };
+}
+</script>
+</body>
+</html>
