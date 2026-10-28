@@ -85,8 +85,7 @@ let screenOk = false, ctrlOk = false;
 let sentCount = 0, lastSent = "", ctrlInfo = "", touchCount = 0, fpsText = "";
 function updateStatus() {
   statusEl.textContent =
-    `экран: ${screenOk ? "OK" : "—"}${fpsText} | упр: ${ctrlOk ? "OK" : "—"}${ctrlInfo}` +
-    ` | касаний: ${touchCount} | отправлено: ${sentCount} ${lastSent}`;
+    `экран: ${screenOk ? "OK" : "—"}`;
 }
 
 if (!WS_URL || !TOKEN) {
