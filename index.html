@@ -5,18 +5,26 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
 <title>Remote Control</title>
 <style>
-  html, body { margin:0; padding:0; background:#000; overflow:hidden; touch-action:none; height:100%; }
+  html, body { margin:0; padding:0; background:#000; overflow:hidden; touch-action:none; height:100%;
+               -webkit-user-select:none; user-select:none; -webkit-touch-callout:none; }
   #wrap { position:relative; width:100vw; height:100vh; }
   #screen { width:100%; height:100%; object-fit:contain; display:block; user-select:none; -webkit-user-drag:none; }
+  /* маленькая точка: её центр = точка, куда придётся клик (кончик курсора) */
+  #cursor {
+    position:absolute; left:0; top:0; width:8px; height:8px; margin:-4px 0 0 -4px;
+    border-radius:50%; background:#f22; border:1px solid #fff; box-sizing:border-box;
+    pointer-events:none; display:none; will-change:transform;
+  }
   #status {
     position:absolute; top:8px; left:8px; color:#0f0; font:12px monospace;
-    background:rgba(0,0,0,0.4); padding:2px 6px; border-radius:4px;
+    background:rgba(0,0,0,0.4); padding:2px 6px; border-radius:4px; pointer-events:none;
   }
 </style>
 </head>
 <body>
 <div id="wrap">
-  <img id="screen" draggable="false">
+  <canvas id="screen"></canvas>
+  <div id="cursor"></div>
   <div id="status">подключение...</div>
 </div>
 
@@ -24,35 +32,291 @@
 const tg = window.Telegram?.WebApp;
 tg?.expand();
 tg?.ready();
+// Telegram по умолчанию сворачивает мини-апп свайпом вниз и перехватывает вертикальные жесты
+try { tg?.disableVerticalSwipes?.(); } catch (e) {}
 
 // ---------- Конфигурация из query-параметров ----------
-// Раньше TOKEN/HOST подставлял Jinja2 на сервере. Теперь страница статическая (GitHub Pages),
-// поэтому сервер (бот) сам собирает ссылку вида:
-// https://юзер.github.io/repo/?ws=wss://xxxx.ngrok-free.dev/ws/screen&token=XXXX
-const params = new URLSearchParams(location.search);
-const WS_URL = params.get("ws");     // полный адрес вебсокета, например wss://xxxx.ngrok-free.dev/ws/screen
-const TOKEN  = params.get("token");  // тот же AUTH_TOKEN из config.py
 
-const screenImg = document.getElementById("screen");
+const params = new URLSearchParams(location.search);
+const WS_URL = params.get("ws");      // например wss://host/ws/screen
+const TOKEN  = params.get("token");
+
+const screenCanvas = document.getElementById("screen");
+const screenCtx    = screenCanvas.getContext("2d", { alpha: false, desynchronized: true });
+const cursorEl     = document.getElementById("cursor");
 const statusEl  = document.getElementById("status");
+
+let screenOk = false, ctrlOk = false;
+let sentCount = 0, lastSent = "", ctrlInfo = "", touchCount = 0, fpsText = "";
+function updateStatus() {
+  statusEl.textContent =
+    `экран: ${screenOk ? "OK" : "—"}${fpsText} | упр: ${ctrlOk ? "OK" : "—"}${ctrlInfo}` +
+    ` | касаний: ${touchCount} | отправлено: ${sentCount} ${lastSent}`;
+}
 
 if (!WS_URL || !TOKEN) {
   statusEl.textContent = "ошибка: нет ws/token в ссылке";
 } else {
-  const screenWs = new WebSocket(`${WS_URL}?token=${encodeURIComponent(TOKEN)}`);
-  screenWs.binaryType = "blob";
+  // ---------- Канал экрана: H.264 по WebSocket -> WebCodecs (аппаратный декодер) -> canvas ----------
+  if (typeof VideoDecoder === "undefined") {
+    statusEl.textContent = "ошибка: в этом браузере нет WebCodecs (VideoDecoder)";
+  }
 
-  screenWs.onopen  = () => statusEl.textContent = "экран: OK";
-  screenWs.onclose = () => statusEl.textContent = "экран: отключено";
-  screenWs.onerror = () => statusEl.textContent = "экран: ошибка соединения";
+  const screenWs = new WebSocket(`${WS_URL}?token=${encodeURIComponent(TOKEN)}`);
+  screenWs.binaryType = "arraybuffer";
+  screenWs.onopen  = () => { screenOk = true;  updateStatus(); };
+  screenWs.onclose = () => { screenOk = false; updateStatus(); };
+  screenWs.onerror = () => { statusEl.textContent = "экран: ошибка соединения"; };
+
+  let decoder = null, needKey = true, chunkTs = 0, lastError = "";
+  let latestFrame = null, needDraw = false;
+  let recvFrames = 0, recvBytes = 0, decodedFrames = 0, drawnFrames = 0, droppedFrames = 0;
+  const FRAME_US = 1000000 / 60;
+  const MAX_DECODE_QUEUE = 4;   // декодер отстаёт сильнее -> пропускаем кадры до ближайшего keyframe
+
+  // Строка кодека "avc1.PPCCLL" берём из SPS (NAL type 7) первого keyframe
+  function codecFromKeyframe(u8) {
+    for (let i = 0; i + 6 < u8.length; i++) {
+      if (u8[i] === 0 && u8[i + 1] === 0 && u8[i + 2] === 1 && (u8[i + 3] & 0x1f) === 7) {
+        const h = (b) => b.toString(16).padStart(2, "0");
+        return "avc1." + h(u8[i + 4]) + h(u8[i + 5]) + h(u8[i + 6]);
+      }
+    }
+    return null;
+  }
+
+  function resetDecoder() {
+    try { if (decoder && decoder.state !== "closed") decoder.close(); } catch (e) {}
+    decoder = null; needKey = true;
+  }
+
+  function createDecoder(codec) {
+    decoder = new VideoDecoder({
+      output: (frame) => {
+        if (latestFrame) latestFrame.close();   // показываем всегда самый свежий кадр
+        latestFrame = frame; needDraw = true; decodedFrames++;
+      },
+      error: (e) => { lastError = String(e && e.message || e); resetDecoder(); },
+    });
+    decoder.configure({ codec, optimizeForLatency: true, hardwareAcceleration: "prefer-hardware" });
+  }
+
+  // Позиция курсора: с сервера (настоящая мышь ПК) или локальная (только что отправили мы)
+  let serverCursor = null, localCursor = null, localUntil = 0;
 
   screenWs.onmessage = (ev) => {
-    const url = URL.createObjectURL(ev.data);
-    const oldUrl = screenImg.dataset.blobUrl;
-    screenImg.src = url;
-    screenImg.dataset.blobUrl = url;
-    if (oldUrl) URL.revokeObjectURL(oldUrl);
+    if (typeof ev.data === "string") {
+      try {
+        const d = JSON.parse(ev.data);
+        if (d.type === "cursor") serverCursor = d;
+      } catch (e) {}
+      return;
+    }
+    // подтверждение приёма: сервер не шлёт кадры быстрее, чем они реально доходят
+    if (screenWs.readyState === WebSocket.OPEN) screenWs.send("a");
+    if (typeof VideoDecoder === "undefined") return;
+
+    const u8 = new Uint8Array(ev.data);
+    recvFrames++; recvBytes += u8.length;
+    const key = u8[0] === 1;
+    const data = u8.subarray(1);
+
+    if (!decoder || decoder.state === "closed") {
+      if (!key) return;
+      const codec = codecFromKeyframe(data);
+      if (!codec) return;
+      try { createDecoder(codec); } catch (e) { lastError = String(e && e.message || e); resetDecoder(); return; }
+    }
+    if (needKey && !key) { droppedFrames++; return; }
+    if (decoder.decodeQueueSize > MAX_DECODE_QUEUE) { needKey = true; droppedFrames++; return; }
+    if (key) needKey = false;
+
+    try {
+      decoder.decode(new EncodedVideoChunk({ type: key ? "key" : "delta", timestamp: chunkTs, data }));
+      chunkTs += FRAME_US;
+    } catch (e) { lastError = String(e && e.message || e); resetDecoder(); }
   };
+
+  // Где на экране устройства лежит картинка (object-fit:contain даёт чёрные поля)
+  function layout() {
+    const r  = screenCanvas.getBoundingClientRect();
+    const nw = screenCanvas.width  || r.width;
+    const nh = screenCanvas.height || r.height;
+    const scale = Math.min(r.width / nw, r.height / nh);
+    const dw = nw * scale, dh = nh * scale;
+    return { offX: r.left + (r.width - dw) / 2, offY: r.top + (r.height - dh) / 2, dw, dh };
+  }
+
+  function render() {
+    if (needDraw && latestFrame) {
+      const w = latestFrame.displayWidth, h = latestFrame.displayHeight;
+      if (screenCanvas.width !== w || screenCanvas.height !== h) {
+        screenCanvas.width = w;
+        screenCanvas.height = h;
+      }
+      screenCtx.drawImage(latestFrame, 0, 0);
+      needDraw = false;
+      drawnFrames++;
+    }
+
+    const c = (performance.now() < localUntil && localCursor) ? localCursor : serverCursor;
+    if (c) {
+      const L = layout();
+      cursorEl.style.display = "block";
+      cursorEl.style.transform = `translate(${L.offX + c.x * L.dw}px, ${L.offY + c.y * L.dh}px)`;
+    }
+    requestAnimationFrame(render);
+  }
+  requestAnimationFrame(render);
+
+  // Статистика в статус-строке: сколько кадров реально нарисовано за секунду, битрейт, пропуски
+  setInterval(() => {
+    const mbps = (recvBytes * 8 / 1e6).toFixed(1);
+    fpsText = ` ${drawnFrames} fps (дек. ${decodedFrames}, проп. ${droppedFrames}), ${mbps} Мбит/с` +
+              (lastError ? ` [${lastError}]` : "");
+    recvFrames = recvBytes = drawnFrames = decodedFrames = droppedFrames = 0;
+    updateStatus();
+  }, 1000);
+
+  // ---------- Канал управления ----------
+  // /ws/screen -> /ws/control
+  const CTRL_URL = WS_URL.replace(/\/ws\/screen\/?$/, "/ws/control");
+  let ctrlWs = null;
+  const queue = [];
+
+  function connectCtrl() {
+    ctrlWs = new WebSocket(`${CTRL_URL}?token=${encodeURIComponent(TOKEN)}`);
+    ctrlWs.onopen = () => {
+      ctrlOk = true; updateStatus();
+      while (queue.length) ctrlWs.send(queue.shift());
+    };
+    ctrlWs.onclose = (ev) => {
+      ctrlOk = false; ctrlInfo = ` (код ${ev.code})`; updateStatus();
+      setTimeout(connectCtrl, 1500);   // авто-переподключение
+    };
+  }
+  connectCtrl();
+
+  function send(obj) {
+    // точка сразу прыгает под палец, не дожидаясь ответа сервера
+    if (obj.x !== undefined) {
+      localCursor = { x: obj.x, y: obj.y };
+      localUntil = performance.now() + 300;
+    }
+    const s = JSON.stringify(obj);
+    if (ctrlWs && ctrlWs.readyState === WebSocket.OPEN) ctrlWs.send(s);
+    else if (queue.length < 50) queue.push(s);
+    sentCount++; lastSent = obj.type; updateStatus();
+  }
+
+  // ---------- Перевод координат касания -> доля экрана (0..1) ----------
+  // Картинка показана с object-fit:contain, поэтому по краям могут быть чёрные поля.
+  function toNorm(clientX, clientY) {
+    const { offX, offY, dw, dh } = layout();
+    const clamp = v => Math.max(0, Math.min(1, v));
+    return { x: clamp((clientX - offX) / dw), y: clamp((clientY - offY) / dh) };
+  }
+
+  // ---------- Жесты ----------
+  const MOVE_THRESHOLD = 10;    // px: сдвиг больше -> это перетаскивание, а не тап
+  const LONG_PRESS_MS  = 200;   // удержание -> ПКМ
+  const TAP_MAX_MS     = 250;   // касание дольше этого не считается тапом
+  const TAP_CHAIN_MS   = 350;   // окно между тапами для даблклика / тап+драг
+  const TAP_CHAIN_DIST = 30;    // px: второй тап рядом с первым -> та же точка
+
+  let touch = null;             // текущее касание
+  let lastTap = null;           // { time, clientX, clientY, pos } последнего тапа
+  let lastMoveSent = 0;
+
+  function cancelTouch() {
+    if (touch) {
+      clearTimeout(touch.longTimer);
+      if (touch.dragging) send({ type: "up", button: "left" });
+    }
+    touch = null;
+  }
+
+  document.addEventListener("touchstart", (e) => {
+    e.preventDefault();
+    touchCount++; updateStatus();
+    if (e.touches.length > 1) { cancelTouch(); return; }   // мультитач игнорируем
+
+    const t = e.touches[0];
+    let pos = toNorm(t.clientX, t.clientY);
+
+    // Второе касание рядом и сразу после тапа - берём ту же точку (чтобы ОС засчитала даблклик)
+    const now = performance.now();
+    if (lastTap && now - lastTap.time < TAP_CHAIN_MS &&
+        Math.hypot(t.clientX - lastTap.clientX, t.clientY - lastTap.clientY) < TAP_CHAIN_DIST) {
+      pos = lastTap.pos;
+    }
+
+    touch = {
+      startX: t.clientX, startY: t.clientY,
+      startTime: now,
+      pos,
+      dragging: false,
+      longFired: false,
+      longTimer: null,
+    };
+
+    touch.longTimer = setTimeout(() => {
+      if (!touch || touch.dragging) return;
+      touch.longFired = true;
+      send({ type: "click", button: "right", x: touch.pos.x, y: touch.pos.y });
+      if (navigator.vibrate) navigator.vibrate(20);
+      tg?.HapticFeedback?.impactOccurred("light");
+    }, LONG_PRESS_MS);
+  }, { passive: false });
+
+  document.addEventListener("touchmove", (e) => {
+    e.preventDefault();
+    if (!touch || touch.longFired) return;
+    if (e.touches.length > 1) { cancelTouch(); return; }
+
+    const t = e.touches[0];
+    const moved = Math.hypot(t.clientX - touch.startX, t.clientY - touch.startY);
+
+    if (!touch.dragging) {
+      if (moved < MOVE_THRESHOLD) return;
+      // Начало перетаскивания: ставим курсор в точку касания и зажимаем ЛКМ
+      clearTimeout(touch.longTimer);
+      touch.dragging = true;
+      lastTap = null;
+      send({ type: "down", button: "left", x: touch.pos.x, y: touch.pos.y });
+    }
+
+    // Троттлинг движений (~60 раз/сек)
+    const now = performance.now();
+    if (now - lastMoveSent < 16) return;
+    lastMoveSent = now;
+    const p = toNorm(t.clientX, t.clientY);
+    send({ type: "move", x: p.x, y: p.y });
+  }, { passive: false });
+
+  document.addEventListener("touchend", (e) => {
+    e.preventDefault();
+    if (!touch) return;
+    clearTimeout(touch.longTimer);
+
+    if (touch.dragging) {
+      // Финальная позиция и отпускание ЛКМ
+      const t = e.changedTouches[0];
+      if (t) { const p = toNorm(t.clientX, t.clientY); send({ type: "move", x: p.x, y: p.y }); }
+      send({ type: "up", button: "left" });
+    } else if (!touch.longFired) {
+      const dur = performance.now() - touch.startTime;
+      if (dur <= TAP_MAX_MS) {
+        // Тап = клик ЛКМ. Два быстрых тапа = два клика подряд -> ОС сама видит даблклик.
+        send({ type: "click", button: "left", x: touch.pos.x, y: touch.pos.y });
+        lastTap = { time: performance.now(), clientX: touch.startX, clientY: touch.startY, pos: touch.pos };
+      }
+    }
+    touch = null;
+  }, { passive: false });
+
+  document.addEventListener("touchcancel", () => cancelTouch());
+  document.addEventListener("contextmenu", (e) => e.preventDefault());
 }
 </script>
 </body>
