@@ -189,21 +189,43 @@ if (!WS_URL || !TOKEN) {
   // ---------- Канал управления ----------
   // /ws/screen -> /ws/control
   const CTRL_URL = WS_URL.replace(/\/ws\/screen\/?$/, "/ws/control");
-  let ctrlWs = null;
+  let ctrlWs = null, ctrlTimer = null, lastCtrlRx = 0;
   const queue = [];
 
   function connectCtrl() {
-    ctrlWs = new WebSocket(`${CTRL_URL}?token=${encodeURIComponent(TOKEN)}`);
-    ctrlWs.onopen = () => {
-      ctrlOk = true; updateStatus();
-      while (queue.length) ctrlWs.send(queue.shift());
+    clearTimeout(ctrlTimer);
+    if (ctrlWs && (ctrlWs.readyState === WebSocket.OPEN || ctrlWs.readyState === WebSocket.CONNECTING)) return;
+    const ws = new WebSocket(`${CTRL_URL}?token=${encodeURIComponent(TOKEN)}`);
+    ctrlWs = ws;
+    ws.onopen = () => {
+      if (ctrlWs !== ws) return;
+      ctrlOk = true; lastCtrlRx = performance.now(); updateStatus();
+      while (queue.length) ws.send(queue.shift());
     };
-    ctrlWs.onclose = (ev) => {
+    ws.onmessage = () => { lastCtrlRx = performance.now(); };   // pong от сервера
+    ws.onclose = (ev) => {
+      if (ctrlWs !== ws) return;          // это уже устаревший сокет
       ctrlOk = false; ctrlInfo = ` (код ${ev.code})`; updateStatus();
-      setTimeout(connectCtrl, 1500);   // авто-переподключение
+      ctrlTimer = setTimeout(connectCtrl, 1500);   // авто-переподключение
     };
   }
+  // force=true: выбросить текущий сокет (возможно "полуживой") и подключиться заново
+  function reviveCtrl(force) {
+    if (force && ctrlWs) {
+      const old = ctrlWs; ctrlWs = null; ctrlOk = false; updateStatus();
+      try { old.close(); } catch (e) {}
+    }
+    connectCtrl();
+  }
   connectCtrl();
+
+  // Heartbeat: ловим тихо умерший сокет (после поворота экрана, сна, смены сети)
+  setInterval(() => {
+    if (ctrlWs && ctrlWs.readyState === WebSocket.OPEN) {
+      if (performance.now() - lastCtrlRx > 6000) reviveCtrl(true);
+      else ctrlWs.send('{"type":"ping"}');
+    }
+  }, 2000);
 
   function send(obj) {
     // точка сразу прыгает под палец, не дожидаясь ответа сервера
@@ -244,12 +266,26 @@ if (!WS_URL || !TOKEN) {
     touch = null;
   }
 
+  // Ищем в списке касаний именно наше (по identifier), а не полагаемся на длину списка
+  function findTouch(list) {
+    if (!touch) return null;
+    for (const t of list) if (t.identifier === touch.id) return t;
+    return null;
+  }
+
   document.addEventListener("touchstart", (e) => {
     e.preventDefault();
     touchCount++; updateStatus();
-    if (e.touches.length > 1) { cancelTouch(); return; }   // мультитач игнорируем
 
-    const t = e.touches[0];
+    if (touch) {
+      // Наше касание ещё в списке -> это второй палец: отменяем жест.
+      // Нет в списке -> "призрак" (потерян touchend, напр. при повороте): сбрасываем и начинаем заново.
+      const alive = Array.from(e.touches).some(x => x.identifier === touch.id);
+      cancelTouch();
+      if (alive) return;
+    }
+
+    const t = e.changedTouches[0];
     let pos = toNorm(t.clientX, t.clientY);
 
     // Второе касание рядом и сразу после тапа - берём ту же точку (чтобы ОС засчитала даблклик)
@@ -260,6 +296,7 @@ if (!WS_URL || !TOKEN) {
     }
 
     touch = {
+      id: t.identifier,
       startX: t.clientX, startY: t.clientY,
       startTime: now,
       pos,
@@ -280,9 +317,9 @@ if (!WS_URL || !TOKEN) {
   document.addEventListener("touchmove", (e) => {
     e.preventDefault();
     if (!touch || touch.longFired) return;
-    if (e.touches.length > 1) { cancelTouch(); return; }
+    const t = findTouch(e.touches);
+    if (!t) return;
 
-    const t = e.touches[0];
     const moved = Math.hypot(t.clientX - touch.startX, t.clientY - touch.startY);
 
     if (!touch.dragging) {
@@ -305,12 +342,14 @@ if (!WS_URL || !TOKEN) {
   document.addEventListener("touchend", (e) => {
     e.preventDefault();
     if (!touch) return;
+    const t = findTouch(e.changedTouches);
+    if (!t) return;                       // отпустили не наш палец
     clearTimeout(touch.longTimer);
 
     if (touch.dragging) {
       // Финальная позиция и отпускание ЛКМ
-      const t = e.changedTouches[0];
-      if (t) { const p = toNorm(t.clientX, t.clientY); send({ type: "move", x: p.x, y: p.y }); }
+      const p = toNorm(t.clientX, t.clientY);
+      send({ type: "move", x: p.x, y: p.y });
       send({ type: "up", button: "left" });
     } else if (!touch.longFired) {
       const dur = performance.now() - touch.startTime;
@@ -324,6 +363,22 @@ if (!WS_URL || !TOKEN) {
   }, { passive: false });
 
   document.addEventListener("touchcancel", () => cancelTouch());
+
+  // Поворот экрана / смена размера / сворачивание: сбрасываем жест и оживляем канал управления
+  let envTimer = null;
+  function onEnvChange() {
+    cancelTouch(); lastTap = null;
+    clearTimeout(envTimer);
+    envTimer = setTimeout(() => reviveCtrl(true), 300);
+  }
+  window.addEventListener("resize", onEnvChange);
+  window.addEventListener("orientationchange", onEnvChange);
+  window.addEventListener("pagehide", cancelTouch);
+  document.addEventListener("visibilitychange", () => {
+    cancelTouch();
+    if (!document.hidden) reviveCtrl(true);
+  });
+  tg?.onEvent?.("viewportChanged", onEnvChange);
   document.addEventListener("contextmenu", (e) => e.preventDefault());
 }
 </script>
