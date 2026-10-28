@@ -177,9 +177,11 @@ if (!WS_URL || !TOKEN) {
   setInterval(() => {
     const mbps = (recvBytes * 8 / 1e6).toFixed(1);
     const wc = (typeof VideoDecoder === "undefined") ? "WebCodecs НЕТ" : "WebCodecs да";
+    const ua = (navigator.userAgent.match(/(Chrome|Firefox|SamsungBrowser|MiuiBrowser|YaBrowser|EdgA|OPR|Version)\/[\d.]+/g) || []).join(" ");
+    const env = ` | https:${window.isSecureContext ? "да" : "НЕТ"}, MSE:${typeof MediaSource !== "undefined" ? "да" : "нет"}, ${ua}`;
     fpsText = ` | ${wc} | принято ${recvFrames} (ключ. ${gotKeys}), ${mbps} Мбит/с` +
               ` | дек. ${decodedFrames}, нарис. ${drawnFrames}, проп. ${droppedFrames}` +
-              (codecStr ? ` | ${codecStr}` : "") + (lastError ? ` [${lastError}]` : "");
+              (codecStr ? ` | ${codecStr}` : "") + (lastError ? ` [${lastError}]` : "") + env;
     recvFrames = recvBytes = drawnFrames = decodedFrames = droppedFrames = gotKeys = 0;
     updateStatus();
   }, 1000);
