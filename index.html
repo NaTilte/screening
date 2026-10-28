@@ -248,8 +248,8 @@ if (!WS_URL || !TOKEN) {
   }
 
   // ---------- Жесты ----------
-  const MOVE_THRESHOLD = 10;    // px: сдвиг больше -> это перетаскивание, а не тап
-  const LONG_PRESS_MS  = 200;   // удержание -> ПКМ
+  const MOVE_THRESHOLD = 10;    // px: сдвиг больше -> это движение курсора, а не тап
+  const LONG_PRESS_MS  = 500;   // удержание на месте -> ПКМ
   const TAP_MAX_MS     = 250;   // касание дольше этого не считается тапом
   const TAP_CHAIN_MS   = 350;   // окно между тапами для даблклика / тап+драг
   const TAP_CHAIN_DIST = 30;    // px: второй тап рядом с первым -> та же точка
@@ -289,10 +289,13 @@ if (!WS_URL || !TOKEN) {
     let pos = toNorm(t.clientX, t.clientY);
 
     // Второе касание рядом и сразу после тапа - берём ту же точку (чтобы ОС засчитала даблклик)
+    // Такое "цепное" касание при движении превращается в перетаскивание (выделение).
     const now = performance.now();
+    let chained = false;
     if (lastTap && now - lastTap.time < TAP_CHAIN_MS &&
         Math.hypot(t.clientX - lastTap.clientX, t.clientY - lastTap.clientY) < TAP_CHAIN_DIST) {
       pos = lastTap.pos;
+      chained = true;
     }
 
     touch = {
@@ -300,12 +303,14 @@ if (!WS_URL || !TOKEN) {
       startX: t.clientX, startY: t.clientY,
       startTime: now,
       pos,
+      chained,
+      moved: false,
       dragging: false,
       longFired: false,
       longTimer: null,
     };
 
-    touch.longTimer = setTimeout(() => {
+    if (!chained) touch.longTimer = setTimeout(() => {
       if (!touch || touch.dragging) return;
       touch.longFired = true;
       send({ type: "click", button: "right", x: touch.pos.x, y: touch.pos.y });
@@ -322,13 +327,17 @@ if (!WS_URL || !TOKEN) {
 
     const moved = Math.hypot(t.clientX - touch.startX, t.clientY - touch.startY);
 
-    if (!touch.dragging) {
+    if (!touch.moved) {
       if (moved < MOVE_THRESHOLD) return;
-      // Начало перетаскивания: ставим курсор в точку касания и зажимаем ЛКМ
       clearTimeout(touch.longTimer);
-      touch.dragging = true;
+      touch.moved = true;
       lastTap = null;
-      send({ type: "down", button: "left", x: touch.pos.x, y: touch.pos.y });
+      // Только "тап + сразу касание и движение" зажимает ЛКМ (выделение/перетаскивание).
+      // Обычное движение пальцем просто двигает курсор.
+      if (touch.chained) {
+        touch.dragging = true;
+        send({ type: "down", button: "left", x: touch.pos.x, y: touch.pos.y });
+      }
     }
 
     // Троттлинг движений (~60 раз/сек)
@@ -351,7 +360,7 @@ if (!WS_URL || !TOKEN) {
       const p = toNorm(t.clientX, t.clientY);
       send({ type: "move", x: p.x, y: p.y });
       send({ type: "up", button: "left" });
-    } else if (!touch.longFired) {
+    } else if (!touch.longFired && !touch.moved) {
       const dur = performance.now() - touch.startTime;
       if (dur <= TAP_MAX_MS) {
         // Тап = клик ЛКМ. Два быстрых тапа = два клика подряд -> ОС сама видит даблклик.
