@@ -71,6 +71,7 @@ if (!WS_URL || !TOKEN) {
   let decoder = null, needKey = true, chunkTs = 0, lastError = "";
   let latestFrame = null, needDraw = false;
   let recvFrames = 0, recvBytes = 0, decodedFrames = 0, drawnFrames = 0, droppedFrames = 0;
+  let gotKeys = 0, codecStr = "";
   const FRAME_US = 1000000 / 60;
   const MAX_DECODE_QUEUE = 4;   // декодер отстаёт сильнее -> пропускаем кадры до ближайшего keyframe
 
@@ -98,6 +99,7 @@ if (!WS_URL || !TOKEN) {
       },
       error: (e) => { lastError = String(e && e.message || e); resetDecoder(); },
     });
+    codecStr = codec;
     decoder.configure({ codec, optimizeForLatency: true, hardwareAcceleration: "prefer-hardware" });
   }
 
@@ -114,11 +116,13 @@ if (!WS_URL || !TOKEN) {
     }
     // подтверждение приёма: сервер не шлёт кадры быстрее, чем они реально доходят
     if (screenWs.readyState === WebSocket.OPEN) screenWs.send("a");
-    if (typeof VideoDecoder === "undefined") return;
-
+    // считаем приём ДО проверки декодера: так видно, доходят ли кадры вообще
     const u8 = new Uint8Array(ev.data);
     recvFrames++; recvBytes += u8.length;
+    if (typeof VideoDecoder === "undefined") return;
+
     const key = u8[0] === 1;
+    if (key) gotKeys++;
     const data = u8.subarray(1);
 
     if (!decoder || decoder.state === "closed") {
@@ -169,12 +173,14 @@ if (!WS_URL || !TOKEN) {
   }
   requestAnimationFrame(render);
 
-  // Статистика в статус-строке: сколько кадров реально нарисовано за секунду, битрейт, пропуски
+  // Статистика в статус-строке: принято / декодировано / нарисовано за секунду
   setInterval(() => {
     const mbps = (recvBytes * 8 / 1e6).toFixed(1);
-    fpsText = ` ${drawnFrames} fps (дек. ${decodedFrames}, проп. ${droppedFrames}), ${mbps} Мбит/с` +
-              (lastError ? ` [${lastError}]` : "");
-    recvFrames = recvBytes = drawnFrames = decodedFrames = droppedFrames = 0;
+    const wc = (typeof VideoDecoder === "undefined") ? "WebCodecs НЕТ" : "WebCodecs да";
+    fpsText = ` | ${wc} | принято ${recvFrames} (ключ. ${gotKeys}), ${mbps} Мбит/с` +
+              ` | дек. ${decodedFrames}, нарис. ${drawnFrames}, проп. ${droppedFrames}` +
+              (codecStr ? ` | ${codecStr}` : "") + (lastError ? ` [${lastError}]` : "");
+    recvFrames = recvBytes = drawnFrames = decodedFrames = droppedFrames = gotKeys = 0;
     updateStatus();
   }, 1000);
 
