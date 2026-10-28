@@ -6,9 +6,33 @@
 <title>Remote Control</title>
 <style>
   html, body { margin:0; padding:0; background:#000; overflow:hidden; touch-action:none; height:100%;
-               -webkit-user-select:none; user-select:none; -webkit-touch-callout:none; }
-  #wrap { position:relative; width:100vw; height:100vh; }
-  #screen { width:100%; height:100%; object-fit:contain; display:block; user-select:none; -webkit-user-drag:none; }
+               -webkit-user-select:none; user-select:none; -webkit-touch-callout:none;
+               -webkit-tap-highlight-color:transparent; }
+  #wrap { position:fixed; inset:0; display:flex; flex-direction:column; }
+
+  /* Зона экрана = рабочая поверхность тачпада */
+  #pad { position:relative; flex:1 1 auto; min-height:0; }
+  #screen { position:absolute; inset:0; width:100%; height:100%; object-fit:contain; display:block;
+            user-select:none; -webkit-user-drag:none; }
+
+  /* Нижняя панель: [ левая кнопка ] [ колёсико ] [ правая кнопка ] */
+  #bar { flex:0 0 auto; display:flex; gap:2px; box-sizing:border-box;
+         height:calc(clamp(64px, 15vh, 110px) + env(safe-area-inset-bottom, 0px));
+         padding-bottom:env(safe-area-inset-bottom, 0px);
+         background:#050506; border-top:1px solid #26262b; }
+  .tp { background:#17171a; position:relative; display:flex; align-items:center; justify-content:center;
+        transition:background .08s; }
+  .tp.on { background:#2e2e35; }
+  #btnL, #btnR { flex:1 1 0; }
+  #btnL { border-bottom-left-radius:12px; }
+  #btnR { border-bottom-right-radius:12px; }
+  #wheel { flex:0 0 clamp(56px, 14vw, 84px); flex-direction:column; justify-content:space-between;
+           padding:10px 0; box-sizing:border-box; }
+  #wheel svg { width:18px; height:18px; fill:none; stroke:#6c6c76; stroke-width:2.4;
+               stroke-linecap:round; stroke-linejoin:round; }
+  #wheel .grip { width:3px; flex:1; margin:6px 0; border-radius:2px;
+                 background:repeating-linear-gradient(#34343b 0 2px, transparent 2px 7px); }
+
   /* маленькая точка: её центр = точка, куда придётся клик (кончик курсора) */
   #cursor {
     position:absolute; left:0; top:0; width:8px; height:8px; margin:-4px 0 0 -4px;
@@ -23,7 +47,18 @@
 </head>
 <body>
 <div id="wrap">
-  <canvas id="screen"></canvas>
+  <div id="pad">
+    <canvas id="screen"></canvas>
+  </div>
+  <div id="bar">
+    <div id="btnL" class="tp"></div>
+    <div id="wheel" class="tp">
+      <svg viewBox="0 0 24 24"><path d="M6 15l6-6 6 6"/></svg>
+      <div class="grip"></div>
+      <svg viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></svg>
+    </div>
+    <div id="btnR" class="tp"></div>
+  </div>
   <div id="cursor"></div>
   <div id="status">подключение...</div>
 </div>
@@ -239,155 +274,179 @@ if (!WS_URL || !TOKEN) {
     sentCount++; lastSent = obj.type; updateStatus();
   }
 
-  // ---------- Перевод координат касания -> доля экрана (0..1) ----------
-  // Картинка показана с object-fit:contain, поэтому по краям могут быть чёрные поля.
-  function toNorm(clientX, clientY) {
-    const { offX, offY, dw, dh } = layout();
-    const clamp = v => Math.max(0, Math.min(1, v));
-    return { x: clamp((clientX - offX) / dw), y: clamp((clientY - offY) / dh) };
-  }
+  // ---------- Тачпад ----------
+  // Экран = поверхность тачпада (относительное движение), снизу: ЛКМ, колёсико, ПКМ.
+  const SENS = 1.6;          // базовая чувствительность (1 = палец через весь экран -> курсор через весь экран)
+  const ACCEL = 0.5;         // ускорение: быстрое движение пальца даёт больший сдвиг
+  const ACCEL_MAX = 3;       // потолок множителя ускорения
+  const TAP_MAX_MS = 250;    // касание короче и без сдвига = тап (клик ЛКМ)
+  const TAP_MOVE_PX = 8;     // сдвиг меньше этого считается дрожанием пальца
+  const SEND_MS = 16;        // не чаще ~60 отправок/с
+  const SCROLL_STEP = 22;    // px движения пальца по колёсику на одно "деление"
 
-  // ---------- Жесты ----------
-  const MOVE_THRESHOLD = 10;    // px: сдвиг больше -> это движение курсора, а не тап
-  const LONG_PRESS_MS  = 500;   // удержание на месте -> ПКМ
-  const TAP_MAX_MS     = 250;   // касание дольше этого не считается тапом
-  const TAP_CHAIN_MS   = 350;   // окно между тапами для даблклика / тап+драг
-  const TAP_CHAIN_DIST = 30;    // px: второй тап рядом с первым -> та же точка
+  const padEl = document.getElementById("pad");
+  const btnLEl = document.getElementById("btnL");
+  const btnREl = document.getElementById("btnR");
+  const wheelEl = document.getElementById("wheel");
 
-  let touch = null;             // текущее касание
-  let lastTap = null;           // { time, clientX, clientY, pos } последнего тапа
-  let lastMoveSent = 0;
-
-  function cancelTouch() {
-    if (touch) {
-      clearTimeout(touch.longTimer);
-      if (touch.dragging) send({ type: "up", button: "left" });
-    }
-    touch = null;
-  }
-
-  // Ищем в списке касаний именно наше (по identifier), а не полагаемся на длину списка
-  function findTouch(list) {
-    if (!touch) return null;
-    for (const t of list) if (t.identifier === touch.id) return t;
+  function findById(list, id) {
+    for (const t of list) if (t.identifier === id) return t;
     return null;
   }
 
-  document.addEventListener("touchstart", (e) => {
+  // --- поверхность тачпада ---
+  let padTouch = null;
+  const pending = { dx: 0, dy: 0 };
+  let lastRel = 0;
+
+  function flushRel() {
+    if (pending.dx || pending.dy) {
+      send({ type: "rel", dx: pending.dx, dy: pending.dy });
+      pending.dx = pending.dy = 0;
+    }
+    lastRel = performance.now();
+  }
+
+  padEl.addEventListener("touchstart", (e) => {
     e.preventDefault();
     touchCount++; updateStatus();
-
-    if (touch) {
-      // Наше касание ещё в списке -> это второй палец: отменяем жест.
-      // Нет в списке -> "призрак" (потерян touchend, напр. при повороте): сбрасываем и начинаем заново.
-      const alive = Array.from(e.touches).some(x => x.identifier === touch.id);
-      cancelTouch();
-      if (alive) return;
-    }
-
+    if (padTouch) return;                       // второй палец на поверхности игнорируем
     const t = e.changedTouches[0];
-    let pos = toNorm(t.clientX, t.clientY);
-
-    // Второе касание рядом и сразу после тапа - берём ту же точку (чтобы ОС засчитала даблклик)
-    // Такое "цепное" касание при движении превращается в перетаскивание (выделение).
     const now = performance.now();
-    let chained = false;
-    if (lastTap && now - lastTap.time < TAP_CHAIN_MS &&
-        Math.hypot(t.clientX - lastTap.clientX, t.clientY - lastTap.clientY) < TAP_CHAIN_DIST) {
-      pos = lastTap.pos;
-      chained = true;
-    }
-
-    touch = {
-      id: t.identifier,
-      startX: t.clientX, startY: t.clientY,
-      startTime: now,
-      pos,
-      chained,
-      moved: false,
-      dragging: false,
-      longFired: false,
-      longTimer: null,
-    };
-
-    if (!chained) touch.longTimer = setTimeout(() => {
-      if (!touch || touch.dragging) return;
-      touch.longFired = true;
-      send({ type: "click", button: "right", x: touch.pos.x, y: touch.pos.y });
-      if (navigator.vibrate) navigator.vibrate(20);
-      tg?.HapticFeedback?.impactOccurred("light");
-    }, LONG_PRESS_MS);
+    padTouch = { id: t.identifier, x: t.clientX, y: t.clientY, sx: t.clientX, sy: t.clientY,
+                 t0: now, tm: now, moved: false };
   }, { passive: false });
 
-  document.addEventListener("touchmove", (e) => {
+  padEl.addEventListener("touchmove", (e) => {
     e.preventDefault();
-    if (!touch || touch.longFired) return;
-    const t = findTouch(e.touches);
+    if (!padTouch) return;
+    const t = findById(e.changedTouches, padTouch.id);
     if (!t) return;
-
-    const moved = Math.hypot(t.clientX - touch.startX, t.clientY - touch.startY);
-
-    if (!touch.moved) {
-      if (moved < MOVE_THRESHOLD) return;
-      clearTimeout(touch.longTimer);
-      touch.moved = true;
-      lastTap = null;
-      // Только "тап + сразу касание и движение" зажимает ЛКМ (выделение/перетаскивание).
-      // Обычное движение пальцем просто двигает курсор.
-      if (touch.chained) {
-        touch.dragging = true;
-        send({ type: "down", button: "left", x: touch.pos.x, y: touch.pos.y });
-      }
-    }
-
-    // Троттлинг движений (~60 раз/сек)
     const now = performance.now();
-    if (now - lastMoveSent < 16) return;
-    lastMoveSent = now;
-    const p = toNorm(t.clientX, t.clientY);
-    send({ type: "move", x: p.x, y: p.y });
-  }, { passive: false });
 
-  document.addEventListener("touchend", (e) => {
-    e.preventDefault();
-    if (!touch) return;
-    const t = findTouch(e.changedTouches);
-    if (!t) return;                       // отпустили не наш палец
-    clearTimeout(touch.longTimer);
-
-    if (touch.dragging) {
-      // Финальная позиция и отпускание ЛКМ
-      const p = toNorm(t.clientX, t.clientY);
-      send({ type: "move", x: p.x, y: p.y });
-      send({ type: "up", button: "left" });
-    } else if (!touch.longFired && !touch.moved) {
-      const dur = performance.now() - touch.startTime;
-      if (dur <= TAP_MAX_MS) {
-        // Тап = клик ЛКМ. Два быстрых тапа = два клика подряд -> ОС сама видит даблклик.
-        send({ type: "click", button: "left", x: touch.pos.x, y: touch.pos.y });
-        lastTap = { time: performance.now(), clientX: touch.startX, clientY: touch.startY, pos: touch.pos };
-      }
+    if (!padTouch.moved) {
+      if (Math.hypot(t.clientX - padTouch.sx, t.clientY - padTouch.sy) < TAP_MOVE_PX) return;
+      padTouch.moved = true;                    // с этого момента это движение, а не тап
+      padTouch.x = t.clientX; padTouch.y = t.clientY; padTouch.tm = now;
+      return;
     }
-    touch = null;
+
+    const dxp = t.clientX - padTouch.x, dyp = t.clientY - padTouch.y;
+    const speed = Math.hypot(dxp, dyp) / Math.max(1, now - padTouch.tm);   // px/мс
+    const gain = SENS * Math.min(1 + speed * ACCEL, ACCEL_MAX);
+    const L = layout();
+    if (L.dw > 0 && L.dh > 0) {
+      pending.dx += dxp / L.dw * gain;
+      pending.dy += dyp / L.dh * gain;
+    }
+    padTouch.x = t.clientX; padTouch.y = t.clientY; padTouch.tm = now;
+    if (now - lastRel >= SEND_MS) flushRel();
   }, { passive: false });
 
-  document.addEventListener("touchcancel", () => cancelTouch());
+  padEl.addEventListener("touchend", (e) => {
+    e.preventDefault();
+    if (!padTouch) return;
+    if (!findById(e.changedTouches, padTouch.id)) return;
+    flushRel();
+    if (!padTouch.moved && performance.now() - padTouch.t0 <= TAP_MAX_MS) {
+      // Тап = клик ЛКМ в текущей позиции курсора. Два быстрых тапа = даблклик.
+      send({ type: "click", button: "left" });
+    }
+    padTouch = null;
+  }, { passive: false });
 
-  // Поворот экрана / смена размера / сворачивание: сбрасываем жест и оживляем канал управления
+  padEl.addEventListener("touchcancel", () => { flushRel(); padTouch = null; });
+
+  // --- кнопки: нажал = down, отпустил = up (удержание = кнопка зажата, два тапа = даблклик) ---
+  const releasers = [];
+
+  function bindButton(el, button) {
+    let id = null;
+    function release() {
+      if (id === null) return;
+      id = null;
+      el.classList.remove("on");
+      send({ type: "up", button });
+    }
+    releasers.push(release);
+
+    el.addEventListener("touchstart", (e) => {
+      e.preventDefault();
+      touchCount++; updateStatus();
+      if (id !== null) return;
+      id = e.changedTouches[0].identifier;
+      el.classList.add("on");
+      send({ type: "down", button });
+      if (navigator.vibrate) navigator.vibrate(8);
+      tg?.HapticFeedback?.impactOccurred("light");
+    }, { passive: false });
+
+    el.addEventListener("touchend", (e) => {
+      e.preventDefault();
+      if (id !== null && findById(e.changedTouches, id)) release();
+    }, { passive: false });
+
+    el.addEventListener("touchcancel", () => release());
+  }
+  bindButton(btnLEl, "left");
+  bindButton(btnREl, "right");
+
+  // --- колёсико: ведёшь палец вниз = колесо вниз ---
+  let wheelTouch = null;
+
+  wheelEl.addEventListener("touchstart", (e) => {
+    e.preventDefault();
+    touchCount++; updateStatus();
+    if (wheelTouch) return;
+    const t = e.changedTouches[0];
+    wheelTouch = { id: t.identifier, y: t.clientY, acc: 0 };
+    wheelEl.classList.add("on");
+  }, { passive: false });
+
+  wheelEl.addEventListener("touchmove", (e) => {
+    e.preventDefault();
+    if (!wheelTouch) return;
+    const t = findById(e.changedTouches, wheelTouch.id);
+    if (!t) return;
+    wheelTouch.acc += t.clientY - wheelTouch.y;
+    wheelTouch.y = t.clientY;
+    const n = Math.trunc(wheelTouch.acc / SCROLL_STEP);
+    if (n) {
+      wheelTouch.acc -= n * SCROLL_STEP;
+      send({ type: "scroll", dy: -n });         // палец вниз -> колесо вниз (прокрутка вниз)
+    }
+  }, { passive: false });
+
+  function endWheel(e) {
+    if (!wheelTouch) return;
+    if (e && !findById(e.changedTouches, wheelTouch.id)) return;
+    wheelTouch = null;
+    wheelEl.classList.remove("on");
+  }
+  wheelEl.addEventListener("touchend", (e) => { e.preventDefault(); endWheel(e); }, { passive: false });
+  wheelEl.addEventListener("touchcancel", () => endWheel());
+
+  // Поворот экрана / смена размера / сворачивание: отпускаем всё, оживляем канал управления
+  function resetInput() {
+    flushRel(); padTouch = null;
+    wheelTouch = null; wheelEl.classList.remove("on");
+    releasers.forEach(r => r());
+  }
   let envTimer = null;
   function onEnvChange() {
-    cancelTouch(); lastTap = null;
+    resetInput();
     clearTimeout(envTimer);
     envTimer = setTimeout(() => reviveCtrl(true), 300);
   }
   window.addEventListener("resize", onEnvChange);
   window.addEventListener("orientationchange", onEnvChange);
-  window.addEventListener("pagehide", cancelTouch);
+  window.addEventListener("pagehide", resetInput);
   document.addEventListener("visibilitychange", () => {
-    cancelTouch();
+    resetInput();
     if (!document.hidden) reviveCtrl(true);
   });
   tg?.onEvent?.("viewportChanged", onEnvChange);
+
   document.addEventListener("contextmenu", (e) => e.preventDefault());
 }
 </script>
