@@ -57,6 +57,13 @@
                   background:#1e1e23; color:#e6e6e6; font:13px sans-serif; }
   .kbRow button.on { background:#2e7d32; }
   .kbRow button:active { background:#34343b; }
+  #kbTabs { display:flex; gap:4px; margin-bottom:6px; }
+  #kbTabs button { flex:1 1 0; height:32px; padding:0; border:0; border-radius:7px;
+                   background:#141418; color:#8d8d98; font:13px sans-serif; }
+  #kbTabs button.sel { background:#2a2a31; color:#fff; }
+  .kbPage { display:none; }
+  .kbPage.open { display:block; }
+  .kbRow button.lat { background:#1565c0; }
   #kbFnRows { display:none; }
   #kbFnRows.open { display:block; }
   #kbInput { position:absolute; left:-9999px; top:0; width:1px; height:1px; opacity:0; }
@@ -81,6 +88,10 @@
   <input id="kbInput" type="text" autocomplete="off" autocorrect="off" autocapitalize="off"
          spellcheck="false" inputmode="text" enterkeyhint="send">
   <div id="kbPanel">
+    <div id="kbTabs">
+      <button id="tabSpecial" class="sel">Спецклавиши</button><button id="tabHold">Зажим</button>
+    </div>
+    <div class="kbPage open" id="kbPageSpecial">
     <div id="kbFnRows">
       <div class="kbRow">
         <button data-k="f1">F1</button><button data-k="f2">F2</button><button data-k="f3">F3</button>
@@ -112,6 +123,28 @@
       <button data-combo="ctrl+x">Cut</button><button data-combo="ctrl+z">Undo</button>
       <button data-combo="ctrl+a">All</button><button data-combo="alt+tab">Alt+Tab</button>
       <button id="kbFnBtn">Fn</button>
+    </div>
+    </div>
+    <div class="kbPage" id="kbPageHold">
+      <div class="kbRow">
+        <button data-h="ctrl">Ctrl</button><button data-h="alt">Alt</button>
+        <button data-h="shift">Shift</button><button data-h="win">Win</button>
+        <button id="kbLock">Фикс</button>
+      </div>
+      <div class="kbRow">
+        <button data-h="tab" data-rep="1">Tab</button><button data-h="esc">Esc</button>
+        <button data-h="enter">Enter</button><button data-h="space" data-rep="1">Space</button>
+        <button data-h="delete" data-rep="1">Del</button><button data-h="f4">F4</button>
+      </div>
+      <div class="kbRow">
+        <button data-h="left" data-rep="1">&larr;</button><button data-h="down" data-rep="1">&darr;</button>
+        <button data-h="up" data-rep="1">&uarr;</button><button data-h="right" data-rep="1">&rarr;</button>
+        <button data-h="home">Home</button><button data-h="end">End</button>
+      </div>
+      <div class="kbRow">
+        <button data-h="a">A</button><button data-h="c">C</button><button data-h="v">V</button>
+        <button data-h="x">X</button><button data-h="z">Z</button><button data-h="y">Y</button>
+      </div>
     </div>
   </div>
   <div id="status">подключение...</div>
@@ -547,7 +580,7 @@ if (!WS_URL || !TOKEN) {
     if (textMode) kbIn.focus({ preventScroll: true });   // не даём клавиатуре телефона закрыться
   }
 
-  kbPanel.querySelectorAll("button").forEach((b) => {
+  kbPanel.querySelectorAll("#kbPageSpecial button").forEach((b) => {
     let t1 = null, t2 = null;
     const stop = () => { clearTimeout(t1); clearInterval(t2); t1 = t2 = null; };
     b.addEventListener("mousedown", (e) => e.preventDefault());   // не отбирать фокус у поля ввода
@@ -560,11 +593,81 @@ if (!WS_URL || !TOKEN) {
     ["pointerup", "pointerleave", "pointercancel"].forEach((ev) => b.addEventListener(ev, stop));
   });
 
+  // ---------- Вкладки панели: «Спецклавиши» / «Зажим» ----------
+  const tabBtns = { special: document.getElementById("tabSpecial"), hold: document.getElementById("tabHold") };
+  const pages   = { special: document.getElementById("kbPageSpecial"), hold: document.getElementById("kbPageHold") };
+  function showTab(name) {
+    for (const k in pages) {
+      pages[k].classList.toggle("open", k === name);
+      tabBtns[k].classList.toggle("sel", k === name);
+    }
+  }
+  for (const k in tabBtns) {
+    tabBtns[k].addEventListener("mousedown", (e) => e.preventDefault());
+    tabBtns[k].addEventListener("pointerdown", (e) => {
+      e.preventDefault();
+      showTab(k);
+      if (textMode) kbIn.focus({ preventScroll: true });
+    });
+  }
+
+  // ---------- Вкладка «Зажим»: кнопка повторяет палец ----------
+  // Тап = одно нажатие. Держишь палец = клавиша зажата на ПК, пока не отпустишь (пальцев может быть несколько:
+  // одним держишь Alt, другим тыкаешь Tab). «Фикс»: тап по Ctrl/Alt/Shift/Win защёлкивает клавишу (синяя)
+  // до следующего тапа по ней.
+  const MOD_KEYS = ["ctrl", "alt", "shift", "win"];
+  const holdBtns = Array.from(document.querySelectorAll("#kbPageHold [data-h]"));
+  const lockBtn = document.getElementById("kbLock");
+  let lockMode = false;
+  lockBtn.addEventListener("mousedown", (e) => e.preventDefault());
+  lockBtn.addEventListener("pointerdown", (e) => {
+    e.preventDefault();
+    lockMode = !lockMode;
+    lockBtn.classList.toggle("on", lockMode);
+  });
+
+  function releaseHold() { holdBtns.forEach((b) => b._release && b._release()); }
+  releasers.push(releaseHold);   // поворот экрана / сворачивание: ничего не должно остаться зажатым
+
+  holdBtns.forEach((b) => {
+    const key = b.dataset.h;
+    let down = false, latched = false, t1 = null, t2 = null;
+    function up() {
+      clearTimeout(t1); clearInterval(t2); t1 = t2 = null;
+      if (down || latched) send({ type: "keyup", key });
+      down = latched = false;
+      b.classList.remove("on", "lat");
+    }
+    b._release = up;
+    b.addEventListener("mousedown", (e) => e.preventDefault());
+    b.addEventListener("pointerdown", (e) => {
+      e.preventDefault();
+      try { b.setPointerCapture(e.pointerId); } catch (err) {}
+      if (latched) { up(); return; }            // тап по защёлкнутой клавише отпускает её
+      if (down) return;
+      send({ type: "keydown", key });
+      down = true;
+      if (lockMode && MOD_KEYS.includes(key)) {
+        latched = true;
+        b.classList.add("lat");
+      } else {
+        b.classList.add("on");
+        if (b.dataset.rep) t1 = setTimeout(() => {      // удержание стрелок/Tab = автоповтор
+          t2 = setInterval(() => send({ type: "keydown", key }), 55);
+        }, 380);
+      }
+      if (navigator.vibrate) navigator.vibrate(6);
+      if (textMode) kbIn.focus({ preventScroll: true });
+    });
+    const end = () => { if (down && !latched) up(); };
+    ["pointerup", "pointercancel", "lostpointercapture"].forEach((ev) => b.addEventListener(ev, end));
+  });
+
   kbBtn.addEventListener("click", () => {
     const open = !kbPanel.classList.contains("open");
     kbPanel.classList.toggle("open", open);
     kbBtn.classList.toggle("open", open);
-    if (!open) { clearMods(); setTextMode(false); }
+    if (!open) { clearMods(); setTextMode(false); releaseHold(); }
   });
 
   // Текст с клавиатуры телефона. Обычные символы и Backspace перехватываем и шлём сразу;
@@ -601,452 +704,3 @@ if (!WS_URL || !TOKEN) {
 </script>
 </body>
 </html>
-
-
-
-<!-- <!DOCTYPE html>
-<html lang="ru">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
-<title>Remote Control</title>
-<style>
-  html, body { margin:0; padding:0; background:#000; overflow:hidden; touch-action:none; height:100%;
-               -webkit-user-select:none; user-select:none; -webkit-touch-callout:none;
-               -webkit-tap-highlight-color:transparent; }
-  #wrap { position:fixed; inset:0; display:flex; flex-direction:column; }
-
-  /* Зона экрана = рабочая поверхность тачпада */
-  #pad { position:relative; flex:1 1 auto; min-height:0; }
-  #screen { position:absolute; inset:0; width:100%; height:100%; object-fit:contain; display:block;
-            user-select:none; -webkit-user-drag:none; }
-
-  /* Нижняя панель: [ левая кнопка ] [ колёсико ] [ правая кнопка ] */
-  #bar { flex:0 0 auto; display:flex; gap:2px; box-sizing:border-box;
-         height:calc(clamp(64px, 15vh, 110px) + env(safe-area-inset-bottom, 0px));
-         padding-bottom:env(safe-area-inset-bottom, 0px);
-         background:#050506; border-top:1px solid #26262b; }
-  .tp { background:#17171a; position:relative; display:flex; align-items:center; justify-content:center;
-        transition:background .08s; }
-  .tp.on { background:#2e2e35; }
-  #btnL, #btnR { flex:1 1 0; }
-  #btnL { border-bottom-left-radius:12px; }
-  #btnR { border-bottom-right-radius:12px; }
-  #wheel { flex:0 0 clamp(56px, 14vw, 84px); flex-direction:column; justify-content:space-between;
-           padding:10px 0; box-sizing:border-box; }
-  #wheel svg { width:18px; height:18px; fill:none; stroke:#6c6c76; stroke-width:2.4;
-               stroke-linecap:round; stroke-linejoin:round; }
-  #wheel .grip { width:3px; flex:1; margin:6px 0; border-radius:2px;
-                 background:repeating-linear-gradient(#34343b 0 2px, transparent 2px 7px); }
-
-  /* маленькая точка: её центр = точка, куда придётся клик (кончик курсора) */
-  #cursor {
-    position:absolute; left:0; top:0; width:8px; height:8px; margin:-4px 0 0 -4px;
-    border-radius:50%; background:#f22; border:1px solid #fff; box-sizing:border-box;
-    pointer-events:none; display:none; will-change:transform;
-  }
-  #status {
-    position:absolute; top:8px; left:8px; color:#0f0; font:12px monospace;
-    background:rgba(0,0,0,0.4); padding:2px 6px; border-radius:4px; pointer-events:none;
-  }
-</style>
-</head>
-<body>
-<div id="wrap">
-  <div id="pad">
-    <canvas id="screen"></canvas>
-  </div>
-  <div id="bar">
-    <div id="btnL" class="tp"></div>
-    <div id="wheel" class="tp">
-      <svg viewBox="0 0 24 24"><path d="M6 15l6-6 6 6"/></svg>
-      <div class="grip"></div>
-      <svg viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></svg>
-    </div>
-    <div id="btnR" class="tp"></div>
-  </div>
-  <div id="cursor"></div>
-  <div id="status">подключение...</div>
-</div>
-
-<script>
-const tg = window.Telegram?.WebApp;
-tg?.expand();
-tg?.ready();
-// Telegram по умолчанию сворачивает мини-апп свайпом вниз и перехватывает вертикальные жесты
-try { tg?.disableVerticalSwipes?.(); } catch (e) {}
-
-// ---------- Конфигурация из query-параметров ----------
-
-const params = new URLSearchParams(location.search);
-const WS_URL = params.get("ws");      // например wss://host/ws/screen
-const TOKEN  = params.get("token");
-
-const screenCanvas = document.getElementById("screen");
-const screenCtx    = screenCanvas.getContext("2d", { alpha: false, desynchronized: true });
-const cursorEl     = document.getElementById("cursor");
-const statusEl  = document.getElementById("status");
-
-let screenOk = false, ctrlOk = false;
-let sentCount = 0, lastSent = "", ctrlInfo = "", touchCount = 0, fpsText = "";
-function updateStatus() {
-  statusEl.textContent =
-    `экран: ${screenOk ? "OK" : "—"}`;
-}
-
-if (!WS_URL || !TOKEN) {
-  statusEl.textContent = "ошибка: нет ws/token в ссылке";
-} else {
-  // ---------- Канал экрана: H.264 по WebSocket -> WebCodecs (аппаратный декодер) -> canvas ----------
-  if (typeof VideoDecoder === "undefined") {
-    statusEl.textContent = "ошибка: в этом браузере нет WebCodecs (VideoDecoder)";
-  }
-
-  const screenWs = new WebSocket(`${WS_URL}?token=${encodeURIComponent(TOKEN)}`);
-  screenWs.binaryType = "arraybuffer";
-  screenWs.onopen  = () => { screenOk = true;  updateStatus(); };
-  screenWs.onclose = () => { screenOk = false; updateStatus(); };
-  screenWs.onerror = () => { statusEl.textContent = "экран: ошибка соединения"; };
-
-  let decoder = null, needKey = true, chunkTs = 0, lastError = "";
-  let latestFrame = null, needDraw = false;
-  let recvFrames = 0, recvBytes = 0, decodedFrames = 0, drawnFrames = 0, droppedFrames = 0;
-  let gotKeys = 0, codecStr = "";
-  const FRAME_US = 1000000 / 60;
-  const MAX_DECODE_QUEUE = 4;   // декодер отстаёт сильнее -> пропускаем кадры до ближайшего keyframe
-
-  // Строка кодека "avc1.PPCCLL" берём из SPS (NAL type 7) первого keyframe
-  function codecFromKeyframe(u8) {
-    for (let i = 0; i + 6 < u8.length; i++) {
-      if (u8[i] === 0 && u8[i + 1] === 0 && u8[i + 2] === 1 && (u8[i + 3] & 0x1f) === 7) {
-        const h = (b) => b.toString(16).padStart(2, "0");
-        return "avc1." + h(u8[i + 4]) + h(u8[i + 5]) + h(u8[i + 6]);
-      }
-    }
-    return null;
-  }
-
-  function resetDecoder() {
-    try { if (decoder && decoder.state !== "closed") decoder.close(); } catch (e) {}
-    decoder = null; needKey = true;
-  }
-
-  function createDecoder(codec) {
-    decoder = new VideoDecoder({
-      output: (frame) => {
-        if (latestFrame) latestFrame.close();   // показываем всегда самый свежий кадр
-        latestFrame = frame; needDraw = true; decodedFrames++;
-      },
-      error: (e) => { lastError = String(e && e.message || e); resetDecoder(); },
-    });
-    codecStr = codec;
-    decoder.configure({ codec, optimizeForLatency: true, hardwareAcceleration: "prefer-hardware" });
-  }
-
-  // Позиция курсора: с сервера (настоящая мышь ПК) или локальная (только что отправили мы)
-  let serverCursor = null, localCursor = null, localUntil = 0;
-
-  screenWs.onmessage = (ev) => {
-    if (typeof ev.data === "string") {
-      try {
-        const d = JSON.parse(ev.data);
-        if (d.type === "cursor") serverCursor = d;
-      } catch (e) {}
-      return;
-    }
-    // подтверждение приёма: сервер не шлёт кадры быстрее, чем они реально доходят
-    if (screenWs.readyState === WebSocket.OPEN) screenWs.send("a");
-    // считаем приём ДО проверки декодера: так видно, доходят ли кадры вообще
-    const u8 = new Uint8Array(ev.data);
-    recvFrames++; recvBytes += u8.length;
-    if (typeof VideoDecoder === "undefined") return;
-
-    const key = u8[0] === 1;
-    if (key) gotKeys++;
-    const data = u8.subarray(1);
-
-    if (!decoder || decoder.state === "closed") {
-      if (!key) return;
-      const codec = codecFromKeyframe(data);
-      if (!codec) return;
-      try { createDecoder(codec); } catch (e) { lastError = String(e && e.message || e); resetDecoder(); return; }
-    }
-    if (needKey && !key) { droppedFrames++; return; }
-    if (decoder.decodeQueueSize > MAX_DECODE_QUEUE) { needKey = true; droppedFrames++; return; }
-    if (key) needKey = false;
-
-    try {
-      decoder.decode(new EncodedVideoChunk({ type: key ? "key" : "delta", timestamp: chunkTs, data }));
-      chunkTs += FRAME_US;
-    } catch (e) { lastError = String(e && e.message || e); resetDecoder(); }
-  };
-
-  // Где на экране устройства лежит картинка (object-fit:contain даёт чёрные поля)
-  function layout() {
-    const r  = screenCanvas.getBoundingClientRect();
-    const nw = screenCanvas.width  || r.width;
-    const nh = screenCanvas.height || r.height;
-    const scale = Math.min(r.width / nw, r.height / nh);
-    const dw = nw * scale, dh = nh * scale;
-    return { offX: r.left + (r.width - dw) / 2, offY: r.top + (r.height - dh) / 2, dw, dh };
-  }
-
-  function render() {
-    if (needDraw && latestFrame) {
-      const w = latestFrame.displayWidth, h = latestFrame.displayHeight;
-      if (screenCanvas.width !== w || screenCanvas.height !== h) {
-        screenCanvas.width = w;
-        screenCanvas.height = h;
-      }
-      screenCtx.drawImage(latestFrame, 0, 0);
-      needDraw = false;
-      drawnFrames++;
-    }
-
-    const c = (performance.now() < localUntil && localCursor) ? localCursor : serverCursor;
-    if (c) {
-      const L = layout();
-      cursorEl.style.display = "block";
-      cursorEl.style.transform = `translate(${L.offX + c.x * L.dw}px, ${L.offY + c.y * L.dh}px)`;
-    }
-    requestAnimationFrame(render);
-  }
-  requestAnimationFrame(render);
-
-  // Статистика в статус-строке: принято / декодировано / нарисовано за секунду
-  setInterval(() => {
-    const mbps = (recvBytes * 8 / 1e6).toFixed(1);
-    updateStatus();
-  }, 1000);
-
-  // ---------- Канал управления ----------
-  // /ws/screen -> /ws/control
-  const CTRL_URL = WS_URL.replace(/\/ws\/screen\/?$/, "/ws/control");
-  let ctrlWs = null, ctrlTimer = null, lastCtrlRx = 0;
-  const queue = [];
-
-  function connectCtrl() {
-    clearTimeout(ctrlTimer);
-    if (ctrlWs && (ctrlWs.readyState === WebSocket.OPEN || ctrlWs.readyState === WebSocket.CONNECTING)) return;
-    const ws = new WebSocket(`${CTRL_URL}?token=${encodeURIComponent(TOKEN)}`);
-    ctrlWs = ws;
-    ws.onopen = () => {
-      if (ctrlWs !== ws) return;
-      ctrlOk = true; lastCtrlRx = performance.now(); updateStatus();
-      while (queue.length) ws.send(queue.shift());
-    };
-    ws.onmessage = () => { lastCtrlRx = performance.now(); };   // pong от сервера
-    ws.onclose = (ev) => {
-      if (ctrlWs !== ws) return;          // это уже устаревший сокет
-      ctrlOk = false; ctrlInfo = ` (код ${ev.code})`; updateStatus();
-      ctrlTimer = setTimeout(connectCtrl, 1500);   // авто-переподключение
-    };
-  }
-  // force=true: выбросить текущий сокет (возможно "полуживой") и подключиться заново
-  function reviveCtrl(force) {
-    if (force && ctrlWs) {
-      const old = ctrlWs; ctrlWs = null; ctrlOk = false; updateStatus();
-      try { old.close(); } catch (e) {}
-    }
-    connectCtrl();
-  }
-  connectCtrl();
-
-  // Heartbeat: ловим тихо умерший сокет (после поворота экрана, сна, смены сети)
-  setInterval(() => {
-    if (ctrlWs && ctrlWs.readyState === WebSocket.OPEN) {
-      if (performance.now() - lastCtrlRx > 6000) reviveCtrl(true);
-      else ctrlWs.send('{"type":"ping"}');
-    }
-  }, 2000);
-
-  function send(obj) {
-    // точка сразу прыгает под палец, не дожидаясь ответа сервера
-    if (obj.x !== undefined) {
-      localCursor = { x: obj.x, y: obj.y };
-      localUntil = performance.now() + 300;
-    }
-    const s = JSON.stringify(obj);
-    if (ctrlWs && ctrlWs.readyState === WebSocket.OPEN) ctrlWs.send(s);
-    else if (queue.length < 50) queue.push(s);
-    sentCount++; lastSent = obj.type; updateStatus();
-  }
-
-  // ---------- Тачпад ----------
-  // Экран = поверхность тачпада (относительное движение), снизу: ЛКМ, колёсико, ПКМ.
-  const SENS = 1.6;          // базовая чувствительность (1 = палец через весь экран -> курсор через весь экран)
-  const ACCEL = 0.5;         // ускорение: быстрое движение пальца даёт больший сдвиг
-  const ACCEL_MAX = 3;       // потолок множителя ускорения
-  const TAP_MAX_MS = 250;    // касание короче и без сдвига = тап (клик ЛКМ)
-  const TAP_MOVE_PX = 8;     // сдвиг меньше этого считается дрожанием пальца
-  const SEND_MS = 16;        // не чаще ~60 отправок/с
-  const SCROLL_STEP = 22;    // px движения пальца по колёсику на одно "деление"
-
-  const padEl = document.getElementById("pad");
-  const btnLEl = document.getElementById("btnL");
-  const btnREl = document.getElementById("btnR");
-  const wheelEl = document.getElementById("wheel");
-
-  function findById(list, id) {
-    for (const t of list) if (t.identifier === id) return t;
-    return null;
-  }
-
-  // --- поверхность тачпада ---
-  let padTouch = null;
-  const pending = { dx: 0, dy: 0 };
-  let lastRel = 0;
-
-  function flushRel() {
-    if (pending.dx || pending.dy) {
-      send({ type: "rel", dx: pending.dx, dy: pending.dy });
-      pending.dx = pending.dy = 0;
-    }
-    lastRel = performance.now();
-  }
-
-  padEl.addEventListener("touchstart", (e) => {
-    e.preventDefault();
-    touchCount++; updateStatus();
-    if (padTouch) return;                       // второй палец на поверхности игнорируем
-    const t = e.changedTouches[0];
-    const now = performance.now();
-    padTouch = { id: t.identifier, x: t.clientX, y: t.clientY, sx: t.clientX, sy: t.clientY,
-                 t0: now, tm: now, moved: false };
-  }, { passive: false });
-
-  padEl.addEventListener("touchmove", (e) => {
-    e.preventDefault();
-    if (!padTouch) return;
-    const t = findById(e.changedTouches, padTouch.id);
-    if (!t) return;
-    const now = performance.now();
-
-    if (!padTouch.moved) {
-      if (Math.hypot(t.clientX - padTouch.sx, t.clientY - padTouch.sy) < TAP_MOVE_PX) return;
-      padTouch.moved = true;                    // с этого момента это движение, а не тап
-      padTouch.x = t.clientX; padTouch.y = t.clientY; padTouch.tm = now;
-      return;
-    }
-
-    const dxp = t.clientX - padTouch.x, dyp = t.clientY - padTouch.y;
-    const speed = Math.hypot(dxp, dyp) / Math.max(1, now - padTouch.tm);   // px/мс
-    const gain = SENS * Math.min(1 + speed * ACCEL, ACCEL_MAX);
-    const L = layout();
-    if (L.dw > 0 && L.dh > 0) {
-      pending.dx += dxp / L.dw * gain;
-      pending.dy += dyp / L.dh * gain;
-    }
-    padTouch.x = t.clientX; padTouch.y = t.clientY; padTouch.tm = now;
-    if (now - lastRel >= SEND_MS) flushRel();
-  }, { passive: false });
-
-  padEl.addEventListener("touchend", (e) => {
-    e.preventDefault();
-    if (!padTouch) return;
-    if (!findById(e.changedTouches, padTouch.id)) return;
-    flushRel();
-    if (!padTouch.moved && performance.now() - padTouch.t0 <= TAP_MAX_MS) {
-      // Тап = клик ЛКМ в текущей позиции курсора. Два быстрых тапа = даблклик.
-      send({ type: "click", button: "left" });
-    }
-    padTouch = null;
-  }, { passive: false });
-
-  padEl.addEventListener("touchcancel", () => { flushRel(); padTouch = null; });
-
-  // --- кнопки: нажал = down, отпустил = up (удержание = кнопка зажата, два тапа = даблклик) ---
-  const releasers = [];
-
-  function bindButton(el, button) {
-    let id = null;
-    function release() {
-      if (id === null) return;
-      id = null;
-      el.classList.remove("on");
-      send({ type: "up", button });
-    }
-    releasers.push(release);
-
-    el.addEventListener("touchstart", (e) => {
-      e.preventDefault();
-      touchCount++; updateStatus();
-      if (id !== null) return;
-      id = e.changedTouches[0].identifier;
-      el.classList.add("on");
-      send({ type: "down", button });
-      if (navigator.vibrate) navigator.vibrate(8);
-      tg?.HapticFeedback?.impactOccurred("light");
-    }, { passive: false });
-
-    el.addEventListener("touchend", (e) => {
-      e.preventDefault();
-      if (id !== null && findById(e.changedTouches, id)) release();
-    }, { passive: false });
-
-    el.addEventListener("touchcancel", () => release());
-  }
-  bindButton(btnLEl, "left");
-  bindButton(btnREl, "right");
-
-  // --- колёсико: ведёшь палец вниз = колесо вниз ---
-  let wheelTouch = null;
-
-  wheelEl.addEventListener("touchstart", (e) => {
-    e.preventDefault();
-    touchCount++; updateStatus();
-    if (wheelTouch) return;
-    const t = e.changedTouches[0];
-    wheelTouch = { id: t.identifier, y: t.clientY, acc: 0 };
-    wheelEl.classList.add("on");
-  }, { passive: false });
-
-  wheelEl.addEventListener("touchmove", (e) => {
-    e.preventDefault();
-    if (!wheelTouch) return;
-    const t = findById(e.changedTouches, wheelTouch.id);
-    if (!t) return;
-    wheelTouch.acc += t.clientY - wheelTouch.y;
-    wheelTouch.y = t.clientY;
-    const n = Math.trunc(wheelTouch.acc / SCROLL_STEP);
-    if (n) {
-      wheelTouch.acc -= n * SCROLL_STEP;
-      send({ type: "scroll", dy: -n });         // палец вниз -> колесо вниз (прокрутка вниз)
-    }
-  }, { passive: false });
-
-  function endWheel(e) {
-    if (!wheelTouch) return;
-    if (e && !findById(e.changedTouches, wheelTouch.id)) return;
-    wheelTouch = null;
-    wheelEl.classList.remove("on");
-  }
-  wheelEl.addEventListener("touchend", (e) => { e.preventDefault(); endWheel(e); }, { passive: false });
-  wheelEl.addEventListener("touchcancel", () => endWheel());
-
-  // Поворот экрана / смена размера / сворачивание: отпускаем всё, оживляем канал управления
-  function resetInput() {
-    flushRel(); padTouch = null;
-    wheelTouch = null; wheelEl.classList.remove("on");
-    releasers.forEach(r => r());
-  }
-  let envTimer = null;
-  function onEnvChange() {
-    resetInput();
-    clearTimeout(envTimer);
-    envTimer = setTimeout(() => reviveCtrl(true), 300);
-  }
-  window.addEventListener("resize", onEnvChange);
-  window.addEventListener("orientationchange", onEnvChange);
-  window.addEventListener("pagehide", resetInput);
-  document.addEventListener("visibilitychange", () => {
-    resetInput();
-    if (!document.hidden) reviveCtrl(true);
-  });
-  tg?.onEvent?.("viewportChanged", onEnvChange);
-
-  document.addEventListener("contextmenu", (e) => e.preventDefault());
-}
-</script>
-</body>
-</html> -->
